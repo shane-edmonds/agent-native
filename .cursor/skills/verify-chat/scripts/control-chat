@@ -1,0 +1,778 @@
+#!/usr/bin/env node
+/**
+ * Verification harness for the Chat template (templates/chat).
+ * Invoked as `control-chat <command> …` — see ../SKILL.md.
+ */
+import { spawn, execFileSync } from "node:child_process";
+import {
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  rmSync,
+  openSync,
+  closeSync,
+} from "node:fs";
+import { resolve, join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+import { createServer } from "node:net";
+import { setTimeout as sleep } from "node:timers/promises";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(__dirname, "../../../..");
+const CHAT_ROOT = join(REPO_ROOT, "templates", "chat");
+const VERIFY_ROOT = join(REPO_ROOT, ".tmp", "verify-chat");
+const RUNS_ROOT = join(VERIFY_ROOT, "runs");
+const EVIDENCE_ROOT = join(VERIFY_ROOT, "evidence");
+const ACTIVE_RUN_FILE = join(VERIFY_ROOT, "active-run.json");
+
+const require = createRequire(join(REPO_ROOT, "package.json"));
+
+function usage(exitCode = 1) {
+  const text = `control-chat — Chat template verification harness
+
+Usage:
+  control-chat launch [--port N] [--run-id ID]
+  control-chat doctor [--run-id ID]
+  control-chat browser goto --url <path-or-url>
+  control-chat browser click --role <role> --name <name>
+  control-chat browser fill --role <role> --name <name> --value <text>
+  control-chat browser press --key <key>
+  control-chat browser snapshot --aria --path <file>
+  control-chat browser screenshot --path <file>
+  control-chat browser wait --role <role> --name <name> [--timeout-ms N]
+  control-chat action -- <action-name> [action-args...]
+  control-chat cleanup [--run-id ID] [--keep-data]
+  control-chat run-id
+
+Environment:
+  VERIFY_CHAT_RUN_ID   Active run id (also written to active-run.json)
+  VERIFY_CHAT_PORT     Preferred port for launch (default: free port near 48173)
+`;
+  process.stderr.write(text);
+  process.exit(exitCode);
+}
+
+function parseArgs(argv) {
+  const out = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") {
+      out._.push(...argv.slice(i + 1));
+      break;
+    }
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        out[key] = true;
+      } else {
+        out[key] = next;
+        i++;
+      }
+    } else {
+      out._.push(a);
+    }
+  }
+  return out;
+}
+
+function ensureDirs() {
+  mkdirSync(RUNS_ROOT, { recursive: true });
+  mkdirSync(EVIDENCE_ROOT, { recursive: true });
+}
+
+function readJson(path) {
+  return JSON.parse(readFileSync(path, "utf8"));
+}
+
+function writeJson(path, value) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(value, null, 2) + "\n");
+}
+
+function activeRunId(explicit) {
+  if (explicit) return String(explicit);
+  if (process.env.VERIFY_CHAT_RUN_ID) return process.env.VERIFY_CHAT_RUN_ID;
+  if (existsSync(ACTIVE_RUN_FILE)) {
+    return readJson(ACTIVE_RUN_FILE).runId;
+  }
+  throw new Error(
+    "No active verify-chat run. Pass --run-id or run control-chat launch first.",
+  );
+}
+
+function runDir(runId) {
+  return join(RUNS_ROOT, runId);
+}
+
+function runStatePath(runId) {
+  return join(runDir(runId), "run.json");
+}
+
+function loadRun(runId) {
+  const path = runStatePath(runId);
+  if (!existsSync(path)) {
+    throw new Error(`Missing run state at ${path}`);
+  }
+  return readJson(path);
+}
+
+function saveRun(state) {
+  writeJson(runStatePath(state.runId), state);
+  writeJson(ACTIVE_RUN_FILE, { runId: state.runId });
+}
+
+function isPidAlive(pid) {
+  if (!pid || !Number.isInteger(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function freePort(preferred) {
+  const tryListen = (port) =>
+    new Promise((resolveListen, reject) => {
+      const server = createServer();
+      server.unref();
+      server.on("error", reject);
+      server.listen(port, "127.0.0.1", () => {
+        const address = server.address();
+        server.close(() => resolveListen(address.port));
+      });
+    });
+
+  if (preferred) {
+    try {
+      return await tryListen(Number(preferred));
+    } catch {
+      process.stderr.write(
+        `warning: preferred port ${preferred} unavailable; selecting a free port\n`,
+      );
+    }
+  }
+  return tryListen(0);
+}
+
+async function waitForUrl(url, { timeoutMs = 120_000, intervalMs = 500 } = {}) {
+  const start = Date.now();
+  let lastError = "";
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(url, {
+        redirect: "manual",
+        headers: { Accept: "text/html" },
+      });
+      // Auth redirects (302) and 200 both mean the server is up.
+      if (res.status >= 200 && res.status < 500) return res.status;
+      lastError = `HTTP ${res.status}`;
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`Server not ready at ${url} within ${timeoutMs}ms (${lastError})`);
+}
+
+function parseSetCookieHeaders(response, baseUrl) {
+  const host = new URL(baseUrl).hostname;
+  const raw =
+    typeof response.headers.getSetCookie === "function"
+      ? response.headers.getSetCookie()
+      : [];
+  const cookies = [];
+  for (const header of raw) {
+    const parts = header.split(";").map((p) => p.trim());
+    const [nv, ...attrs] = parts;
+    const eq = nv.indexOf("=");
+    if (eq <= 0) continue;
+    const name = nv.slice(0, eq);
+    const value = nv.slice(eq + 1);
+    // Clearing cookies (Max-Age=0) should not be kept.
+    const maxAge = attrs.find((a) => /^max-age=/i.test(a));
+    if (maxAge && Number(maxAge.split("=")[1]) === 0) continue;
+    if (!value) continue;
+    const pathAttr = attrs.find((a) => /^path=/i.test(a));
+    const httpOnly = attrs.some((a) => /^httponly$/i.test(a));
+    const secure = attrs.some((a) => /^secure$/i.test(a));
+    const sameSiteAttr = attrs.find((a) => /^samesite=/i.test(a));
+    let sameSite = "Lax";
+    if (sameSiteAttr) {
+      const v = sameSiteAttr.split("=")[1]?.toLowerCase();
+      if (v === "strict") sameSite = "Strict";
+      else if (v === "none") sameSite = "None";
+      else sameSite = "Lax";
+    }
+    cookies.push({
+      name,
+      value,
+      domain: host,
+      path: pathAttr ? pathAttr.split("=")[1] : "/",
+      expires: -1,
+      httpOnly,
+      secure,
+      sameSite,
+    });
+  }
+  return cookies;
+}
+
+async function ensureLocalDevSession(state) {
+  const url = `${state.baseUrl}/_agent-native/auth/local-dev`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+    redirect: "manual",
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(
+      `Local-dev sign-in failed: HTTP ${res.status} ${text.slice(0, 200)}`,
+    );
+  }
+  const cookies = parseSetCookieHeaders(res, state.baseUrl);
+  if (!cookies.some((c) => c.name.startsWith("an_session"))) {
+    throw new Error(
+      "Local-dev sign-in returned no an_session* cookie; cannot drive Chat.",
+    );
+  }
+  const storagePath = join(runDir(state.runId), "storage-state.json");
+  writeJson(storagePath, { cookies, origins: [] });
+  state.authenticated = true;
+  state.storageStatePath = storagePath;
+  saveRun(state);
+  return { storagePath, cookieNames: cookies.map((c) => c.name) };
+}
+
+async function ensureUsablePage(page, timeout = 60_000) {
+  const homeHeading = page.getByRole("heading", { name: "Get started" });
+  const continueBtn = page.getByRole("button", {
+    name: "Continue as local dev",
+  });
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (await homeHeading.first().isVisible().catch(() => false)) return "home";
+    if (await continueBtn.first().isVisible().catch(() => false)) {
+      await Promise.all([
+        page
+          .waitForURL((url) => !url.pathname.includes("/sign-in"), {
+            timeout: 30_000,
+          })
+          .catch(() => {}),
+        continueBtn.first().click({ timeout: 10_000 }),
+      ]);
+      await homeHeading.first().waitFor({ state: "visible", timeout: 30_000 });
+      return "home-after-continue";
+    }
+    await sleep(250);
+  }
+  throw new Error(
+    `Page never became usable (no Get started / Continue as local dev). url=${page.url()}`,
+  );
+}
+
+async function cmdLaunch(args) {
+  ensureDirs();
+  const runId =
+    args["run-id"] ||
+    process.env.VERIFY_CHAT_RUN_ID ||
+    `chat-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
+  const dir = runDir(runId);
+  if (existsSync(runStatePath(runId))) {
+    const existing = loadRun(runId);
+    if (isPidAlive(existing.pid)) {
+      throw new Error(
+        `Run ${runId} is already live (pid ${existing.pid}). Cleanup first or use a new --run-id.`,
+      );
+    }
+  }
+
+  mkdirSync(dir, { recursive: true });
+  const dataDir = join(dir, "pglite");
+  const logPath = join(dir, "dev.log");
+  const port = await freePort(
+    args.port || process.env.VERIFY_CHAT_PORT || 48173,
+  );
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const databaseUrl = `pglite:${dataDir}`;
+
+  writeFileSync(logPath, "");
+  const logFd = openSync(logPath, "a");
+  const child = spawn(
+    "pnpm",
+    ["exec", "agent-native", "dev", "--port", String(port)],
+    {
+      cwd: CHAT_ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        DATABASE_URL: databaseUrl,
+        // Keep verification off the developer's shared local DB and browser open.
+        BROWSER: "none",
+      },
+      // Redirect to the log file so closing this helper cannot SIGPIPE the server.
+      stdio: ["ignore", logFd, logFd],
+      detached: true,
+    },
+  );
+  closeSync(logFd);
+
+  const state = {
+    runId,
+    pid: child.pid,
+    port,
+    baseUrl,
+    dataDir,
+    databaseUrl,
+    chatRoot: CHAT_ROOT,
+    logPath,
+    startedAt: new Date().toISOString(),
+    evidenceRoot: EVIDENCE_ROOT,
+  };
+  saveRun(state);
+  child.unref();
+
+  try {
+    await waitForUrl(`${baseUrl}/home`);
+  } catch (err) {
+    try {
+      process.kill(-child.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(child.pid, "SIGTERM");
+      } catch {
+        // already gone
+      }
+    }
+    throw err;
+  }
+
+  // Establish the loopback local-dev session so browser drives start authenticated.
+  const session = await ensureLocalDevSession(state);
+
+  process.stdout.write(
+    JSON.stringify(
+      {
+        ok: true,
+        runId,
+        pid: child.pid,
+        baseUrl,
+        dataDir,
+        logPath,
+        evidenceRoot: EVIDENCE_ROOT,
+        storageStatePath: session.storagePath,
+        authenticated: true,
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+}
+
+async function cmdDoctor(args) {
+  const runId = activeRunId(args["run-id"]);
+  const state = loadRun(runId);
+  const alive = isPidAlive(state.pid);
+  let httpStatus = null;
+  let httpError = null;
+  let sessionOk = false;
+  let sessionError = null;
+  try {
+    const res = await fetch(`${state.baseUrl}/home`, { redirect: "manual" });
+    httpStatus = res.status;
+  } catch (err) {
+    httpError = err instanceof Error ? err.message : String(err);
+  }
+
+  const storagePath =
+    state.storageStatePath || join(runDir(runId), "storage-state.json");
+  try {
+    if (!existsSync(storagePath)) {
+      await ensureLocalDevSession(state);
+    }
+    const storage = readJson(storagePath);
+    const cookieHeader = (storage.cookies || [])
+      .map((c) => `${c.name}=${c.value}`)
+      .join("; ");
+    const sessionRes = await fetch(
+      `${state.baseUrl}/_agent-native/agent-engine/status`,
+      {
+        headers: { cookie: cookieHeader, Accept: "application/json" },
+        redirect: "manual",
+      },
+    );
+    // Authenticated clients get 2xx (or an app-level JSON body); 401 means the
+    // session cookie is missing/invalid and the instance is not worth driving.
+    sessionOk = sessionRes.status !== 401 && sessionRes.status < 500;
+    if (!sessionOk) {
+      sessionError = `agent-engine/status HTTP ${sessionRes.status}`;
+    }
+  } catch (err) {
+    sessionError = err instanceof Error ? err.message : String(err);
+  }
+
+  let portOwnerOk = false;
+  if (alive && state.port) {
+    try {
+      const out = execFileSync(
+        "ss",
+        ["-ltnp", `sport = :${state.port}`],
+        { encoding: "utf8" },
+      );
+      portOwnerOk =
+        out.includes(String(state.pid)) || /pid=\d+/.test(out);
+    } catch {
+      // ss may be unavailable; treat as unknown rather than fail-closed below.
+      portOwnerOk = alive;
+    }
+  }
+
+  const ok =
+    alive &&
+    httpStatus !== null &&
+    httpStatus >= 200 &&
+    httpStatus < 500 &&
+    existsSync(state.dataDir) &&
+    sessionOk;
+
+  const report = {
+    ok,
+    runId,
+    pid: state.pid,
+    pidAlive: alive,
+    port: state.port,
+    portOwnedByPid: portOwnerOk,
+    baseUrl: state.baseUrl,
+    dataDir: state.dataDir,
+    dataDirExists: existsSync(state.dataDir),
+    httpStatus,
+    httpError,
+    sessionOk,
+    sessionError,
+    storageStatePath: storagePath,
+    evidenceRoot: state.evidenceRoot || EVIDENCE_ROOT,
+    chatRoot: state.chatRoot,
+  };
+  process.stdout.write(JSON.stringify(report, null, 2) + "\n");
+  if (!ok) process.exit(1);
+}
+
+function resolveTargetUrl(state, urlOrPath) {
+  if (/^https?:\/\//i.test(urlOrPath)) return urlOrPath;
+  const path = urlOrPath.startsWith("/") ? urlOrPath : `/${urlOrPath}`;
+  return `${state.baseUrl}${path}`;
+}
+
+async function withBrowser(state, fn, { restoreLastUrl = true } = {}) {
+  const { chromium } = require("@playwright/test");
+  const storagePath = join(runDir(state.runId), "storage-state.json");
+  const browser = await chromium.launch({
+    channel: process.env.VERIFY_CHAT_BROWSER_CHANNEL || "chrome",
+    headless: process.env.VERIFY_CHAT_HEADED === "1" ? false : true,
+  });
+  const contextOptions = {
+    viewport: { width: 1280, height: 800 },
+    baseURL: state.baseUrl,
+  };
+  if (existsSync(storagePath)) {
+    contextOptions.storageState = storagePath;
+  }
+  const context = await browser.newContext(contextOptions);
+  const page = await context.newPage();
+  try {
+    if (restoreLastUrl && state.lastUrl) {
+      await page.goto(state.lastUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 30_000,
+      });
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(
+        () => {},
+      );
+    }
+    const result = await fn(page, context);
+    state.lastUrl = page.url();
+    saveRun(state);
+    await context.storageState({ path: storagePath }).catch(() => {});
+    return result;
+  } finally {
+    await context.close();
+    await browser.close();
+  }
+}
+
+function locatorFor(page, role, name) {
+  if (!role) throw new Error("--role is required");
+  if (!name) throw new Error("--name is required");
+  return page.getByRole(role, { name, exact: false });
+}
+
+async function cmdBrowser(sub, args) {
+  const runId = activeRunId(args["run-id"]);
+  const state = loadRun(runId);
+  if (!isPidAlive(state.pid)) {
+    throw new Error(`Run ${runId} process ${state.pid} is not alive. Relaunch.`);
+  }
+
+  const restoreLastUrl = sub !== "goto";
+  await withBrowser(
+    state,
+    async (page) => {
+    const timeout = Number(args["timeout-ms"] || 30_000);
+
+    switch (sub) {
+      case "goto": {
+        const target = resolveTargetUrl(state, args.url || args._[0] || "/home");
+        const res = await page.goto(target, {
+          waitUntil: "domcontentloaded",
+          timeout,
+        });
+        await page.waitForLoadState("networkidle", { timeout }).catch(() => {});
+        let usable = "as-navigated";
+        const onSignIn = page.url().includes("/sign-in");
+        const wantsHome = /\/home\/?$/.test(new URL(target).pathname);
+        if (onSignIn || wantsHome) {
+          usable = await ensureUsablePage(page, timeout);
+        }
+        process.stdout.write(
+          JSON.stringify({
+            ok: true,
+            url: page.url(),
+            status: res?.status() ?? null,
+            title: await page.title(),
+            usable,
+          }) + "\n",
+        );
+        return;
+      }
+      case "click": {
+        const loc = locatorFor(page, args.role, args.name);
+        await loc.first().click({ timeout });
+        if (String(args.name || "").includes("Continue as local dev")) {
+          await ensureUsablePage(page, timeout);
+        }
+        process.stdout.write(
+          JSON.stringify({ ok: true, action: "click", role: args.role, name: args.name, url: page.url() }) +
+            "\n",
+        );
+        return;
+      }
+      case "fill": {
+        const loc = locatorFor(page, args.role, args.name);
+        await loc.first().fill(String(args.value ?? ""), { timeout });
+        process.stdout.write(
+          JSON.stringify({
+            ok: true,
+            action: "fill",
+            role: args.role,
+            name: args.name,
+            value: String(args.value ?? ""),
+          }) + "\n",
+        );
+        return;
+      }
+      case "press": {
+        await page.keyboard.press(String(args.key || args._[0]));
+        process.stdout.write(
+          JSON.stringify({ ok: true, action: "press", key: args.key }) + "\n",
+        );
+        return;
+      }
+      case "wait": {
+        const loc = locatorFor(page, args.role, args.name);
+        await loc.first().waitFor({ state: "visible", timeout });
+        process.stdout.write(
+          JSON.stringify({ ok: true, action: "wait", role: args.role, name: args.name }) +
+            "\n",
+        );
+        return;
+      }
+      case "snapshot": {
+        if (!args.path) throw new Error("--path is required for snapshot");
+        const outPath = resolve(String(args.path));
+        mkdirSync(dirname(outPath), { recursive: true });
+        let text;
+        if (args.aria) {
+          text = await page.locator("body").ariaSnapshot();
+        } else {
+          text = await page.content();
+        }
+        writeFileSync(outPath, text + (text.endsWith("\n") ? "" : "\n"));
+        process.stdout.write(
+          JSON.stringify({ ok: true, path: outPath, bytes: Buffer.byteLength(text) }) +
+            "\n",
+        );
+        return;
+      }
+      case "screenshot": {
+        if (!args.path) throw new Error("--path is required for screenshot");
+        const outPath = resolve(String(args.path));
+        mkdirSync(dirname(outPath), { recursive: true });
+        await page.screenshot({ path: outPath, fullPage: true });
+        process.stdout.write(JSON.stringify({ ok: true, path: outPath }) + "\n");
+        return;
+      }
+      default:
+        usage(1);
+    }
+  },
+    { restoreLastUrl },
+  );
+}
+
+function cmdAction(args) {
+  const runId = activeRunId(args["run-id"]);
+  const state = loadRun(runId);
+  const actionArgs = args._;
+  if (actionArgs.length === 0) {
+    throw new Error("Usage: control-chat action -- <name> [args...]");
+  }
+  const result = execFileSync(
+    "pnpm",
+    ["exec", "agent-native", "action", ...actionArgs],
+    {
+      cwd: state.chatRoot,
+      env: {
+        ...process.env,
+        DATABASE_URL: state.databaseUrl,
+        PORT: String(state.port),
+      },
+      encoding: "utf8",
+    },
+  );
+  process.stdout.write(result);
+}
+
+function sleepSync(ms) {
+  const start = Date.now();
+  while (Date.now() - start < ms) {
+    /* busy wait — cleanup path only */
+  }
+}
+
+function killTree(pid) {
+  if (!isPidAlive(pid)) return;
+  try {
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // gone
+    }
+  }
+  const start = Date.now();
+  while (Date.now() - start < 5_000) {
+    if (!isPidAlive(pid)) return;
+    sleepSync(100);
+  }
+  try {
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // gone
+    }
+  }
+}
+
+function cmdCleanup(args) {
+  const runId = activeRunId(args["run-id"]);
+  const state = loadRun(runId);
+  killTree(state.pid);
+
+  if (!args["keep-data"]) {
+    const dataDir = state.dataDir;
+    if (dataDir && dataDir.startsWith(join(VERIFY_ROOT, "runs")) && existsSync(dataDir)) {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+    // Drop auth secret / storage for this run only — never evidence.
+    for (const name of ["storage-state.json", "dev.log"]) {
+      const p = join(runDir(runId), name);
+      if (existsSync(p) && name !== "dev.log") {
+        // keep dev.log for postmortems; remove storage
+      }
+    }
+    const storagePath = join(runDir(runId), "storage-state.json");
+    if (existsSync(storagePath)) rmSync(storagePath, { force: true });
+  }
+
+  if (existsSync(ACTIVE_RUN_FILE)) {
+    try {
+      const active = readJson(ACTIVE_RUN_FILE);
+      if (active.runId === runId) rmSync(ACTIVE_RUN_FILE, { force: true });
+    } catch {
+      rmSync(ACTIVE_RUN_FILE, { force: true });
+    }
+  }
+
+  process.stdout.write(
+    JSON.stringify({
+      ok: true,
+      runId,
+      stoppedPid: state.pid,
+      evidenceRoot: state.evidenceRoot || EVIDENCE_ROOT,
+      evidencePreserved: true,
+      dataRemoved: !args["keep-data"],
+    }) + "\n",
+  );
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0 || argv[0] === "-h" || argv[0] === "--help") usage(0);
+  const [command, maybeSub, ...rest] = argv;
+
+  try {
+    if (command === "launch") {
+      await cmdLaunch(parseArgs(rest));
+      return;
+    }
+    if (command === "doctor") {
+      await cmdDoctor(parseArgs([maybeSub, ...rest].filter(Boolean)));
+      return;
+    }
+    if (command === "browser") {
+      if (!maybeSub) usage(1);
+      await cmdBrowser(maybeSub, parseArgs(rest));
+      return;
+    }
+    if (command === "action") {
+      // Pass action argv through literally so flags like --name are not eaten
+      // by control-chat's own option parser.
+      const actionArgv =
+        maybeSub === "--"
+          ? rest
+          : [maybeSub, ...rest].filter((v) => v !== undefined);
+      if (actionArgv.length === 0) {
+        throw new Error("Usage: control-chat action -- <name> [args...]");
+      }
+      cmdAction({ _: actionArgv, "run-id": process.env.VERIFY_CHAT_RUN_ID });
+      return;
+    }
+    if (command === "cleanup") {
+      cmdCleanup(parseArgs([maybeSub, ...rest].filter(Boolean)));
+      return;
+    }
+    if (command === "run-id") {
+      process.stdout.write(activeRunId(undefined) + "\n");
+      return;
+    }
+    usage(1);
+  } catch (err) {
+    process.stderr.write(
+      (err instanceof Error ? err.message : String(err)) + "\n",
+    );
+    process.exit(1);
+  }
+}
+
+await main();
